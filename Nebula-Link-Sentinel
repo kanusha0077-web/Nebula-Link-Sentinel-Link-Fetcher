@@ -1,0 +1,661 @@
+// ==UserScript==
+// @name         Nebula Link Sentinel
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  Passive link intelligence radar: collects URLs from DOM, attributes, and network, with domain-aware stats and quick export.
+// @author       rix4uni (refactored)
+// @match        *://*/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
+// @grant        GM_xmlhttpRequest
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const STORAGE_KEY = 'nebulaLinkSentinelLinks';
+    const PANEL_ID = 'nebulaLinkSentinelUI';
+
+    let allLinks = GM_getValue(STORAGE_KEY, {}); // { url: { count, firstSeen, lastSeen, pages: [], domain } }
+    let currentPageLinks = new Set();
+    let currentDomainLinks = new Set();
+    let networkRequests = new Set();
+    let lastScanTimestamp = null;
+
+    // -------------------------------
+    // Utility helpers
+    // -------------------------------
+
+    function safeLog(...args) {
+        try {
+            console.log('[Nebula Link Sentinel]', ...args);
+        } catch (e) {}
+    }
+
+    function getDomainFromUrl(url) {
+        try {
+            return new URL(url).hostname || 'unknown';
+        } catch (e) {
+            return 'unknown';
+        }
+    }
+
+    // Enhanced URL validation with better filtering
+    function isValidUrl(string) {
+        if (!string || typeof string !== 'string') return false;
+
+        // Common false positives to exclude
+        const falsePositives = [
+            'javascript:',
+            'mailto:',
+            'tel:',
+            'data:',
+            '#',
+            'about:',
+            'void(0)',
+            'undefined',
+            'null',
+            'function()'
+        ];
+
+        if (falsePositives.some(fp => string.toLowerCase().includes(fp))) {
+            return false;
+        }
+
+        // Length filters
+        if (string.length < 5 || string.length > 500) return false;
+
+        // Must contain at least one dot (for domains) or be an absolute/relative path
+        if (!string.includes('.') && !string.startsWith('/')) return false;
+
+        // Common file extensions to include
+        const validExtensions = [
+            '.html', '.htm', '.php', '.asp', '.aspx', '.jsp',
+            '.js', '.css', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp',
+            '.ico', '.woff', '.woff2', '.ttf', '.eot',
+            '.json', '.xml', '.txt', '.pdf', '.doc', '.docx'
+        ];
+
+        const hasValidExtension = validExtensions.some(ext =>
+            string.toLowerCase().includes(ext)
+        );
+
+        // URL pattern matching
+        const urlPatterns = [
+            /https?:\/\/[^\s"'<>(){}|\\^`\[\]]+/i, // http URLs
+            /\/\/[^\s"'<>(){}|\\^`\[\]]+/i,        // protocol-relative URLs
+            /\/[^\s"'<>(){}|\\^`\[\]]*[a-zA-Z0-9](?:\/[^\s"'<>(){}|\\^`\[\]]*)?/i, // absolute paths
+            /\.\/[^\s"'<>(){}|\\^`\[\]]+/i,        // relative paths ./...
+            /\.\.[^\s"'<>(){}|\\^`\[\]]+/i         // relative paths ../...
+        ];
+
+        const matchesPattern = urlPatterns.some(pattern => pattern.test(string));
+
+        return matchesPattern || hasValidExtension;
+    }
+
+    // Convert to absolute URL
+    function toAbsoluteUrl(url, baseUrl = window.location.href) {
+        try {
+            let cleanUrl = url.trim();
+            cleanUrl = cleanUrl.replace(/^['"`]|['"`]$/g, '');
+            cleanUrl = cleanUrl.replace(/&amp;/g, '&');
+            cleanUrl = cleanUrl.replace(/&quot;/g, '"');
+            cleanUrl = cleanUrl.replace(/&lt;/g, '<');
+            cleanUrl = cleanUrl.replace(/&gt;/g, '>');
+
+            if (cleanUrl.startsWith('http')) {
+                return new URL(cleanUrl).href;
+            }
+            if (cleanUrl.startsWith('//')) {
+                return new URL(window.location.protocol + cleanUrl).href;
+            }
+            return new URL(cleanUrl, baseUrl).href;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function safeSetClipboard(text, successMessage) {
+        try {
+            GM_setClipboard(text, 'text');
+            showNotification(successMessage);
+        } catch (e) {
+            console.error('[Nebula Link Sentinel] Clipboard error:', e);
+            alert('Nebula Link Sentinel: clipboard access failed. Check console for details.');
+        }
+    }
+
+    // -------------------------------
+    // Method 1: Network Requests
+    // -------------------------------
+
+    function setupNetworkMonitoring() {
+        if (!window.performance || !window.performance.getEntriesByType) return;
+
+        // Existing resource entries
+        try {
+            const resources = performance.getEntriesByType('resource');
+            resources.forEach(resource => {
+                const url = resource.name;
+                if (isValidUrl(url)) {
+                    const absoluteUrl = toAbsoluteUrl(url);
+                    if (absoluteUrl) {
+                        networkRequests.add(absoluteUrl);
+                    }
+                }
+            });
+        } catch (e) {
+            safeLog('Performance entries access failed:', e);
+        }
+
+        // Wrap fetch
+        const originalFetch = window.fetch;
+        if (originalFetch) {
+            window.fetch = function (...args) {
+                const url = args[0];
+                if (typeof url === 'string' && isValidUrl(url)) {
+                    const absoluteUrl = toAbsoluteUrl(url);
+                    if (absoluteUrl) {
+                        networkRequests.add(absoluteUrl);
+                    }
+                }
+                return originalFetch.apply(this, args);
+            };
+        }
+
+        // Observe new performance resource entries
+        if (typeof PerformanceObserver !== 'undefined') {
+            try {
+                const observer = new PerformanceObserver((list) => {
+                    list.getEntries().forEach(entry => {
+                        const url = entry.name;
+                        if (isValidUrl(url)) {
+                            const absoluteUrl = toAbsoluteUrl(url);
+                            if (absoluteUrl) {
+                                networkRequests.add(absoluteUrl);
+                            }
+                        }
+                    });
+                });
+                observer.observe({ entryTypes: ['resource'] });
+            } catch (e) {
+                // ignore unsupported
+            }
+        }
+    }
+
+    // -------------------------------
+    // Method 2: HTML Source Scanning
+    // -------------------------------
+
+    function scanHtmlSource() {
+        const links = new Set();
+        const html = document.documentElement.outerHTML;
+
+        const urlPatterns = [
+            /(?:href|src|content|data|action|custom-srv|country-svc|api-url|url|service|endpoint)\s*=\s*["']([^"']+)["']/gi,
+            /(?:url|src|link|image|endpoint|api)\s*\(\s*["']([^"']+)["']\s*\)/gi,
+            /["'](https?:\/\/[^"'\s<>(){}]+\.[^"'\s<>(){}]+)["']/gi,
+            /["'](\/\/[^"'\s<>(){}]+\.[^"'\s<>(){}]+)["']/gi,
+            /["'](\/[^"'\s<>(){}][^"'\s<>(){}]*)["']/gi,
+            /(https?:\/\/[^\s<>(){}"']+)/gi,
+            /(\/\/[^\s<>(){}"']+)/gi
+        ];
+
+        urlPatterns.forEach(pattern => {
+            let match;
+            while ((match = pattern.exec(html)) !== null) {
+                const url = match[1] || match[0];
+                if (isValidUrl(url)) {
+                    const absoluteUrl = toAbsoluteUrl(url);
+                    if (absoluteUrl) {
+                        links.add(absoluteUrl);
+                    }
+                }
+            }
+        });
+
+        return Array.from(links);
+    }
+
+    // -------------------------------
+    // Method 3: Attribute Scanning
+    // -------------------------------
+
+    function scanAttributes() {
+        const links = new Set();
+        const attributes = [
+            'href', 'src', 'content', 'data-src',
+            'data-href', 'action', 'cite', 'poster',
+            'background', 'srcset'
+        ];
+
+        attributes.forEach(attr => {
+            const elements = document.querySelectorAll(`[${attr}]`);
+            elements.forEach(element => {
+                const value = element.getAttribute(attr);
+                if (!value) return;
+
+                if (attr === 'srcset') {
+                    value.split(',').forEach(part => {
+                        const url = part.trim().split(' ')[0];
+                        if (isValidUrl(url)) {
+                            const absoluteUrl = toAbsoluteUrl(url);
+                            if (absoluteUrl) {
+                                links.add(absoluteUrl);
+                            }
+                        }
+                    });
+                } else if (isValidUrl(value)) {
+                    const absoluteUrl = toAbsoluteUrl(value);
+                    if (absoluteUrl) {
+                        links.add(absoluteUrl);
+                    }
+                }
+            });
+        });
+
+        return Array.from(links);
+    }
+
+    // -------------------------------
+    // Main link extraction
+    // -------------------------------
+
+    function extractAllLinks() {
+        const currentUrl = window.location.href;
+        const currentHost = window.location.hostname;
+        const links = new Set();
+
+        // Combine methods
+        const attributeLinks = scanAttributes();
+        const htmlLinks = scanHtmlSource();
+        const networkLinks = Array.from(networkRequests);
+
+        [attributeLinks, htmlLinks, networkLinks].forEach(methodLinks => {
+            methodLinks.forEach(link => {
+                if (link && isValidUrl(link)) {
+                    links.add(link);
+                }
+            });
+        });
+
+        currentPageLinks.clear();
+        currentDomainLinks.clear();
+
+        const nowISO = new Date().toISOString();
+        lastScanTimestamp = nowISO;
+
+        links.forEach(link => {
+            currentPageLinks.add(link);
+
+            const domain = getDomainFromUrl(link);
+            if (domain === currentHost) {
+                currentDomainLinks.add(link);
+            }
+
+            if (!allLinks[link]) {
+                allLinks[link] = {
+                    count: 0,
+                    firstSeen: nowISO,
+                    lastSeen: nowISO,
+                    pages: [],
+                    domain: domain
+                };
+            }
+
+            allLinks[link].count++;
+            allLinks[link].lastSeen = nowISO;
+
+            if (!allLinks[link].pages.includes(currentUrl)) {
+                allLinks[link].pages.push(currentUrl);
+            }
+        });
+
+        GM_setValue(STORAGE_KEY, allLinks);
+        updateUI();
+    }
+
+    // -------------------------------
+    // UI
+    // -------------------------------
+
+    function updateUI() {
+        const existing = document.getElementById(PANEL_ID);
+        if (existing) {
+            existing.remove();
+        }
+
+        const totalUniqueLinks = Object.keys(allLinks).length;
+        const currentPageLinkCount = currentPageLinks.size;
+        const networkRequestCount = networkRequests.size;
+
+        const uniqueDomains = new Set();
+        Object.keys(allLinks).forEach(url => {
+            uniqueDomains.add(allLinks[url].domain || getDomainFromUrl(url));
+        });
+
+        const ui = document.createElement('div');
+        ui.id = PANEL_ID;
+        ui.style.cssText = `
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background: #141a22;
+            color: #ecf0f1;
+            padding: 12px;
+            border-radius: 8px;
+            font-family: Arial, sans-serif;
+            font-size: 12px;
+            z-index: 100000;
+            max-width: 360px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.35);
+            border: 1px solid #34495e;
+            max-height: 80vh;
+            overflow-y: auto;
+        `;
+
+        const header = document.createElement('div');
+        header.style.display = 'flex';
+        header.style.justifyContent = 'space-between';
+        header.style.alignItems = 'center';
+        header.style.marginBottom = '8px';
+        header.style.cursor = 'move';
+
+        const title = document.createElement('div');
+        title.innerHTML = '<strong>🛰️ Nebula Link Sentinel</strong>';
+        title.style.fontSize = '13px';
+
+        const headerButtons = document.createElement('div');
+
+        const collapseBtn = document.createElement('button');
+        collapseBtn.textContent = '–';
+        collapseBtn.title = 'Collapse/expand';
+        collapseBtn.style.cssText = `
+            background: #2c3e50;
+            color: #ecf0f1;
+            border: none;
+            width: 20px;
+            height: 20px;
+            border-radius: 3px;
+            cursor: pointer;
+            margin-right: 4px;
+        `;
+
+        const closeBtn = document.createElement('button');
+        closeBtn.textContent = '×';
+        closeBtn.title = 'Hide panel';
+        closeBtn.style.cssText = `
+            background: #c0392b;
+            color: #ecf0f1;
+            border: none;
+            width: 20px;
+            height: 20px;
+            border-radius: 3px;
+            cursor: pointer;
+        `;
+
+        headerButtons.appendChild(collapseBtn);
+        headerButtons.appendChild(closeBtn);
+
+        header.appendChild(title);
+        header.appendChild(headerButtons);
+
+        const stats = document.createElement('div');
+        stats.style.marginBottom = '8px';
+        stats.style.lineHeight = '1.4';
+        const lastScanText = lastScanTimestamp
+            ? new Date(lastScanTimestamp).toLocaleTimeString()
+            : 'n/a';
+
+        stats.innerHTML = `
+            <div>🔢 Indexed URLs: <strong>${totalUniqueLinks}</strong></div>
+            <div>📄 This page: <strong>${currentPageLinkCount}</strong></div>
+            <div>🌐 Network-sourced: <strong>${networkRequestCount}</strong></div>
+            <div>🏷️ Unique domains: <strong>${uniqueDomains.size}</strong></div>
+            <div>⏱️ Last scan: <strong>${lastScanText}</strong></div>
+            <div>📍 Host: ${window.location.hostname}</div>
+        `;
+
+        const contentWrapper = document.createElement('div');
+        contentWrapper.style.marginTop = '6px';
+
+        const buttons = document.createElement('div');
+        buttons.style.display = 'flex';
+        buttons.style.flexDirection = 'column';
+        buttons.style.gap = '5px';
+        buttons.style.marginBottom = '4px';
+
+        const copyAllTextBtn = createButton('📋 Copy all URLs (text)', '#27ae60', copyAllLinksText);
+        const copyAllJsonBtn = createButton('🧾 Copy all URLs (JSON)', '#16a085', copyAllLinksJson);
+        const copyCurrentPageBtn = createButton('📄 Copy this page URLs', '#2980b9', copyCurrentPageLinks);
+        const copyCurrentDomainBtn = createButton('🌍 Copy this domain URLs', '#8e44ad', copyCurrentDomainLinks);
+        const copyNetworkBtn = createButton('🔄 Copy network URLs', '#d35400', copyNetworkRequests);
+        const resetBtn = createButton('🗑️ Reset link index', '#e74c3c', resetCollection);
+
+        buttons.appendChild(copyAllTextBtn);
+        buttons.appendChild(copyAllJsonBtn);
+        buttons.appendChild(copyCurrentPageBtn);
+        buttons.appendChild(copyCurrentDomainBtn);
+        buttons.appendChild(copyNetworkBtn);
+        buttons.appendChild(resetBtn);
+
+        contentWrapper.appendChild(stats);
+        contentWrapper.appendChild(buttons);
+
+        ui.appendChild(header);
+        ui.appendChild(contentWrapper);
+
+        document.body.appendChild(ui);
+        makeDraggable(ui, header);
+
+        collapseBtn.addEventListener('click', () => {
+            const isHidden = contentWrapper.style.display === 'none';
+            contentWrapper.style.display = isHidden ? 'block' : 'none';
+        });
+
+        closeBtn.addEventListener('click', () => {
+            ui.style.display = 'none';
+        });
+    }
+
+    function createButton(text, color, onClick) {
+        const button = document.createElement('button');
+        button.textContent = text;
+        button.style.cssText = `
+            padding: 7px;
+            background: ${color};
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            width: 100%;
+            text-align: left;
+        `;
+        button.addEventListener('click', onClick);
+        return button;
+    }
+
+    function copyAllLinksText() {
+        const urls = Object.keys(allLinks).sort();
+        const text = urls.join('\n');
+        safeSetClipboard(text, `Copied ${urls.length} URLs (text)`);
+    }
+
+    function copyAllLinksJson() {
+        const payload = {
+            generatedAt: new Date().toISOString(),
+            host: window.location.hostname,
+            total: Object.keys(allLinks).length,
+            links: allLinks
+        };
+        const text = JSON.stringify(payload, null, 2);
+        safeSetClipboard(text, 'Copied URLs as JSON');
+    }
+
+    function copyCurrentPageLinks() {
+        const urls = Array.from(currentPageLinks).sort();
+        const text = urls.join('\n');
+        safeSetClipboard(text, `Copied ${urls.length} URLs from this page`);
+    }
+
+    function copyCurrentDomainLinks() {
+        const urls = Array.from(currentDomainLinks).sort();
+        const text = urls.join('\n');
+        safeSetClipboard(text, `Copied ${urls.length} URLs from this domain`);
+    }
+
+    function copyNetworkRequests() {
+        const urls = Array.from(networkRequests).sort();
+        const text = urls.join('\n');
+        safeSetClipboard(text, `Copied ${urls.length} network URLs`);
+    }
+
+    function resetCollection() {
+        if (!confirm('Nebula Link Sentinel: reset all collected URLs?')) {
+            return;
+        }
+        allLinks = {};
+        currentPageLinks.clear();
+        currentDomainLinks.clear();
+        networkRequests.clear();
+        lastScanTimestamp = null;
+        GM_setValue(STORAGE_KEY, {});
+        updateUI();
+        showNotification('Nebula index cleared');
+    }
+
+    function makeDraggable(element, handle) {
+        let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+        const dragHandle = handle || element;
+
+        dragHandle.addEventListener('mousedown', dragMouseDown);
+
+        function dragMouseDown(e) {
+            e.preventDefault();
+            pos3 = e.clientX;
+            pos4 = e.clientY;
+            document.addEventListener('mouseup', closeDragElement);
+            document.addEventListener('mousemove', elementDrag);
+        }
+
+        function elementDrag(e) {
+            e.preventDefault();
+            pos1 = pos3 - e.clientX;
+            pos2 = pos4 - e.clientY;
+            pos3 = e.clientX;
+            pos4 = e.clientY;
+            element.style.top = (element.offsetTop - pos2) + 'px';
+            element.style.left = (element.offsetLeft - pos1) + 'px';
+            element.style.right = 'auto';
+        }
+
+        function closeDragElement() {
+            document.removeEventListener('mouseup', closeDragElement);
+            document.removeEventListener('mousemove', elementDrag);
+        }
+    }
+
+    function showNotification(message) {
+        const notification = document.createElement('div');
+        notification.textContent = message;
+        notification.style.cssText = `
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0,0,0,0.85);
+            color: white;
+            padding: 12px 20px;
+            border-radius: 5px;
+            z-index: 100001;
+            font-family: Arial, sans-serif;
+            font-size: 13px;
+        `;
+        document.body.appendChild(notification);
+        setTimeout(() => notification.remove(), 2000);
+    }
+
+    function togglePanelVisibility() {
+        const panel = document.getElementById(PANEL_ID);
+        if (!panel) return;
+        panel.style.display = (panel.style.display === 'none') ? 'block' : 'none';
+    }
+
+    // -------------------------------
+    // Init
+    // -------------------------------
+
+    function init() {
+        if (!document.body) {
+            // fail-safe: wait until body exists
+            const interval = setInterval(() => {
+                if (document.body) {
+                    clearInterval(interval);
+                    init();
+                }
+            }, 100);
+            return;
+        }
+
+        setupNetworkMonitoring();
+
+        window.addEventListener('load', function () {
+            setTimeout(() => {
+                extractAllLinks();
+            }, 2000);
+        });
+
+        let mutationTimeout = null;
+        const observer = new MutationObserver(function (mutations) {
+            const panel = document.getElementById(PANEL_ID);
+            if (panel && mutations.every(m => panel.contains(m.target))) {
+                return; // ignore mutations from inside our own UI
+            }
+
+            if (mutationTimeout) return;
+            mutationTimeout = setTimeout(() => {
+                mutationTimeout = null;
+                extractAllLinks();
+            }, 1000);
+        });
+
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['href', 'src', 'content']
+        });
+
+        // Global keyboard shortcut: Ctrl+Shift+L toggles the panel
+        window.addEventListener('keydown', (e) => {
+            if (e.ctrlKey && e.shiftKey && (e.key === 'L' || e.key === 'l')) {
+                togglePanelVisibility();
+            }
+        });
+
+        // Tampermonkey menu commands
+        GM_registerMenuCommand('Nebula: Copy all URLs (text)', copyAllLinksText);
+        GM_registerMenuCommand('Nebula: Copy all URLs (JSON)', copyAllLinksJson);
+        GM_registerMenuCommand('Nebula: Copy this page URLs', copyCurrentPageLinks);
+        GM_registerMenuCommand('Nebula: Copy this domain URLs', copyCurrentDomainLinks);
+        GM_registerMenuCommand('Nebula: Copy network URLs', copyNetworkRequests);
+        GM_registerMenuCommand('Nebula: Reset link index', resetCollection);
+
+        // First extraction a bit after DOM ready
+        setTimeout(extractAllLinks, 3000);
+    }
+
+    // Ensure we only touch DOM after it's ready
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+
+})();
