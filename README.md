@@ -2,6 +2,9 @@
 
 **Nebula Link Sentinel** is a Tampermonkey userscript that acts as a **passive link intelligence radar**.
 
+![LinkSentinal](https://raw.githubusercontent.com/kanusha0077-web/ParamScope/main/ParamScope.png)
+
+
 It quietly collects URLs from:
 
 - HTML attributes (`href`, `src`, `srcset`, etc.)
